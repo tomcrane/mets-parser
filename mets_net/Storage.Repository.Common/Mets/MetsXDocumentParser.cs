@@ -11,6 +11,17 @@ namespace Storage.Repository.Common.Mets;
 
 public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDocumentParser
 {
+    /// <summary>
+    /// Pre-built lookup dictionaries for O(1) access to METS elements by ID.
+    /// This mirrors the Python implementation's amd_map, file_map, and tech_map.
+    /// </summary>
+    private sealed record MetsLookupMaps(
+        Dictionary<string, XElement> AmdSecMap,
+        Dictionary<string, XElement> FileMap,
+        Dictionary<string, XElement> TechMdMap,
+        Dictionary<string, XElement> DigiprovMdMap
+    );
+
     public MetsFileWrapper GetMetsFileWrapperFromXDocument(Uri metsUri, XDocument metsXDocument)
     {        
         // load self happens in the outer MetsParser (the one that's aware of filesystem or S3) because it needs to checksum it
@@ -38,6 +49,35 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
         };
     }
     
+
+    /// <summary>
+    /// Builds lookup dictionaries for efficient O(1) access to METS elements by ID.
+    /// This is equivalent to the Python version's amd_map, file_map, and tech_map.
+    /// </summary>
+    private static MetsLookupMaps BuildLookupMaps(XDocument xMets)
+    {
+        // Build amdSec map: ID -> XElement
+        var amdSecMap = xMets.Descendants(XNames.MetsAmdSec)
+            .Where(el => el.Attribute("ID") != null)
+            .ToDictionary(el => el.Attribute("ID")!.Value, el => el);
+
+        // Build file map: ID -> XElement (from fileSec)
+        var fileMap = xMets.Descendants(XNames.MetsFile)
+            .Where(el => el.Attribute("ID") != null)
+            .ToDictionary(el => el.Attribute("ID")!.Value, el => el);
+
+        // Build techMD map: ID -> XElement
+        var techMdMap = xMets.Descendants(XNames.MetsTechMD)
+            .Where(el => el.Attribute("ID") != null)
+            .ToDictionary(el => el.Attribute("ID")!.Value, el => el);
+
+        // Build digiprovMD map: ID -> XElement (for virus scan lookups)
+        var digiprovMdMap = xMets.Descendants(XNames.MetsDigiprovMD)
+            .Where(el => el.Attribute("ID") != null)
+            .ToDictionary(el => el.Attribute("ID")!.Value, el => el);
+
+        return new MetsLookupMaps(amdSecMap, fileMap, techMdMap, digiprovMdMap);
+    }
 
     private void PopulateFromMets(MetsFileWrapper mets, XDocument xMets)
     {
@@ -139,12 +179,14 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
         // Not sure how to be formal about that.
 
         var parent = physicalStructMap;
-        var fileSec = xMets.Descendants(XNames.MetsFileSec).Single();
 
         // This relies on all directories having labels not just some
         Stack<string> directoryLabels = new();
 
-        ProcessChildStructDivs(mets, xMets, parent, fileSec, directoryLabels);
+        // Build lookup maps once before traversal for O(1) access during processing
+        var lookupMaps = BuildLookupMaps(xMets);
+
+        ProcessChildStructDivs(mets, parent, directoryLabels, lookupMaps);
 
         // We should now have a flat list of WorkingFile, and a set of WorkingDirectories, with correct names
         // if supplied. Now assign the files to their directories.
@@ -162,8 +204,8 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
 
     }
 
-    private void ProcessChildStructDivs(MetsFileWrapper mets, XDocument xMets, XElement parent, XElement fileSec,
-        Stack<string> directoryLabels)
+    private void ProcessChildStructDivs(MetsFileWrapper mets, XElement parent,
+        Stack<string> directoryLabels, MetsLookupMaps lookupMaps)
     {
         // We want to create MetsFileWrapper::PhysicalStructure (WorkingDirectories and WorkingFiles).
         // We can traverse the physical structmap, finding div type=Directory and div type=File
@@ -185,10 +227,8 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
                 var admId = div.Attribute("ADMID")?.Value;
                 if (admId.HasText())
                 {
-                    // TODO - put these andSecs into a dictionary - have done in Python version
-                    var amd = xMets.Descendants(XNames.MetsAmdSec)
-                        .SingleOrDefault(t => t.Attribute("ID")!.Value == admId);
-                    if (amd != null)
+                    // Use pre-built dictionary for O(1) lookup instead of LINQ query
+                    if (lookupMaps.AmdSecMap.TryGetValue(admId, out var amd))
                     {
                         var originalName = amd.Descendants(XNames.PremisOriginalName).SingleOrDefault()?.Value;
                         Uri? storageLocation = null;
@@ -242,7 +282,8 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
                 // - this is true for Goobi at Wellcome. But in reality we'd need a stricter check than that.
 
                 var fileId = fptr.Attribute("FILEID")!.Value;
-                var fileEl = fileSec.Descendants(XNames.MetsFile).Single(f => f.Attribute("ID")!.Value == fileId);
+                // Use pre-built dictionary for O(1) lookup instead of LINQ query
+                var fileEl = lookupMaps.FileMap[fileId];
                 var mimeType =
                     fileEl.Attribute("MIMETYPE")
                         ?.Value; // Archivematica does not have this, have to get it from PRONOM, even reverse lookup
@@ -262,14 +303,12 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
                 VirusScanMetadata? virusScanMetadata = null;
                 if (!haveUsedAdmIdAlready)
                 {
-                    var techMd = xMets.Descendants(XNames.MetsTechMD)
-                        .SingleOrDefault(t => t.Attribute("ID")!.Value == admId);
-
-                    if (techMd == null)
+                    // Use pre-built dictionary for O(1) lookup instead of LINQ query
+                    XElement? techMd = null;
+                    if (!lookupMaps.TechMdMap.TryGetValue(admId, out techMd))
                     {
-                        // Archivematica does it this way
-                        techMd = xMets.Descendants(XNames.MetsAmdSec)
-                            .SingleOrDefault(t => t.Attribute("ID")!.Value == admId);
+                        // Archivematica does it this way - fall back to amdSec map
+                        lookupMaps.AmdSecMap.TryGetValue(admId, out techMd);
                     }
 
 
@@ -330,9 +369,19 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
                     };
                 }
 
-                var digiprovMd = xMets.Descendants(XNames.MetsDigiprovMD).SingleOrDefault(t =>
-                    t.Attribute("ID")!.Value.ToLower()
-                        .Contains($"digiprovmd_clamav_{admId.ToLower()}")); //TODO:working file
+                // Use pre-built dictionary for O(1) lookup instead of LINQ query
+                // The digiprovMD ID contains a pattern like "digiprovmd_clamav_{admId}"
+                var clamavKey = $"digiprovMD_clamav_{admId}";
+                if (!lookupMaps.DigiprovMdMap.TryGetValue(clamavKey, out var digiprovMd))
+                {
+                    // Try case-insensitive search through the pre-built map
+                    var matchingKey = lookupMaps.DigiprovMdMap.Keys
+                        .FirstOrDefault(k => k.ToLower().Contains($"digiprovmd_clamav_{admId.ToLower()}"));
+                    if (matchingKey != null)
+                    {
+                        digiprovMd = lookupMaps.DigiprovMdMap[matchingKey];
+                    }
+                }
 
                 var virusEvent = digiprovMd?.Descendants(XNames.PremisEvent).SingleOrDefault();
                 if (virusEvent != null)
@@ -448,7 +497,7 @@ public class MetsXDocumentParser(ILogger<MetsXDocumentParser> logger) : IMetsXDo
 
             }
 
-            ProcessChildStructDivs(mets, xMets, div, fileSec, directoryLabels);
+            ProcessChildStructDivs(mets, div, directoryLabels, lookupMaps);
         }
     }
 
